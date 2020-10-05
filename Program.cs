@@ -1,4 +1,5 @@
-﻿// © James Singleton. EUPL-1.2 (see the LICENSE file for the full license governing this code).
+// © James Singleton. EUPL-1.2 (see the LICENSE file for the full license governing this code).
+// © Martin Rowan. Updates for Owl Energy exported data.
 
 using CsvHelper;
 using System;
@@ -12,8 +13,18 @@ namespace octoyosu
 {
     public static class Program
     {
+        // TODO: Determine if rates really include VAT, to ensure comparison is accurate.
+
+        // Enter supplier rates.
+        private const decimal currentSupplierUnitRate = 0.1146m;
+        private const decimal currentSupplierStandingCharge = 0.19m;
+        private const decimal ocotopusAgileStandingCharge = 0.21m;
+        // Are input readings in UTC or localtime
+        private const bool readingsTimeUtc = false;
+
         public static void Main(string[] args)
         {
+            
             try
             {
                 var sw = Stopwatch.StartNew();
@@ -32,17 +43,16 @@ namespace octoyosu
                     pricingPath = args[1];
                 }
 
-                const decimal sgUr = 0.15288m;
-                const decimal sgSc = 0.2163m;
-
-                const decimal aoSc = 0.21m;
-
                 Console.WriteLine();
                 Console.WriteLine("🐙 🐙 🐙 🐙 🐙 🐙 🐙 🐙 🐙 🐙 🐙 🐙 🐙 🐙 🐙");
                 Console.WriteLine();
 
                 var rates = new Dictionary<DateTime, decimal>();
                 var usages = new List<Usage>();
+                decimal lastKwh = 0;
+                var lastTimeMinute = 99;
+                var lastDay = 0;
+                DateTime time;
 
                 using (var reader = new StreamReader(readingsPath))
                 using (var csv = new CsvReader(reader, CultureInfo.InvariantCulture))
@@ -56,25 +66,35 @@ namespace octoyosu
                     };
                     while (csv.Read())
                     {
-                        var kwh = csv.GetField<decimal>(3);
+                        var kwh = csv.GetField<decimal>(3) /1000;  // Per Day Kwh counter
                         if (kwh <= 0) continue;
 
-                        // Local time, not UTC - e.g. gap at 20200329 00:45
-                        var time = DateTime.ParseExact(csv.GetField<string>(0), "yyyyMMdd HH:mm",
-                            CultureInfo.InvariantCulture, DateTimeStyles.AssumeLocal).ToUniversalTime();
 
-                        if (time.Minute != 00 && time.Minute != 30)
+                        // TODO: Determine if time in Owl output file is UTC or Localtime
+                        if (readingsTimeUtc)
                         {
-                            usage.KWh += kwh;
-                            continue;
+                            time = DateTime.Parse(csv.GetField<string>(0)); // UTC
                         }
+                        else
+                        {
+                            time = DateTime.Parse(csv.GetField<string>(0), CultureInfo.InvariantCulture, DateTimeStyles.AssumeLocal).ToUniversalTime(); // Local Time
+                        }
+                        time = time.AddSeconds(-time.Second);  // seconds, as used time is used as a key for finding matching rates
+
+                        if ((time.Minute != 00 && time.Minute != 30) || (time.Minute == lastTimeMinute)) continue; // Only sample every 30 mins. Only use 1st value when multiple for a given minute.
+
+                        if (time.Day != lastDay) lastKwh = 0;  // Reset the counter for a new day
 
                         usage = new Usage
                         {
-                            KWh = kwh,
+                            KWh = kwh - lastKwh,
                             Time = time,
                         };
                         usages.Add(usage);
+                        lastKwh = kwh; // Track last reading for kwh so that we can determine how much was used in each 30 min period.
+                        lastDay = time.Day;
+
+                        lastTimeMinute = time.Minute;
                     }
                 }
 
@@ -86,11 +106,11 @@ namespace octoyosu
                 var totalKwh = usages.Sum(u => u.KWh);
                 PrintAverages(totalKwh, totalDays, "kWh");
 
-                var sgTotalUnitCost = totalKwh * sgUr;
-                var sgTotalStandingCharge = totalDays * sgSc;
-                var sgTotalCostGbpIncVat = sgTotalUnitCost + sgTotalStandingCharge;
-                Console.WriteLine("Super Green:");
-                PrintAverages(sgTotalCostGbpIncVat, totalDays, "GBP inc. VAT");
+                var currentSupplierTotalUnitCost = totalKwh * currentSupplierUnitRate;
+                var currentSupplierTotalStandingCharge = totalDays * currentSupplierStandingCharge;
+                var currentSupplierTotalCostGbpIncVat = currentSupplierTotalUnitCost + currentSupplierTotalStandingCharge;
+                Console.WriteLine("Current Supplier:");
+                PrintAverages(currentSupplierTotalCostGbpIncVat, totalDays, "GBP inc. VAT");
 
                 Console.WriteLine("Loading agile pricing and calculating...");
                 Console.WriteLine();
@@ -100,7 +120,8 @@ namespace octoyosu
                 {
                     while (csv.Read())
                     {
-                        var time = DateTime.Parse(csv.GetField<string>(0)); // UTC
+                        time = DateTime.Parse(csv.GetField<string>(0)); // UTC
+
                         if (time >= min && time <= max)
                         {
                             rates.Add(time, csv.GetField<decimal>(4)); // inc. VAT
@@ -108,25 +129,25 @@ namespace octoyosu
                     }
                 }
 
-                var aoTotalUnitCost = (
+                var octopusAgileTotalUnitCost = (
                     from usage in usages
                     let rate = rates.SingleOrDefault(r =>
                         r.Key == usage.Time)
                     select rate.Value * 0.01m * usage.KWh
                 ).Sum();
 
-                var aoTotalStandingCharge = totalDays * aoSc;
-                var aoTotalCostIncVat = aoTotalUnitCost + aoTotalStandingCharge;
+                var octopusAgileTotalStandingCharge = totalDays * ocotopusAgileStandingCharge;
+                var octopusAgileTotalCostIncVat = octopusAgileTotalUnitCost + octopusAgileTotalStandingCharge;
                 Console.WriteLine("Agile:");
-                PrintAverages(aoTotalCostIncVat, totalDays, "GBP inc. VAT");
+                PrintAverages(octopusAgileTotalCostIncVat, totalDays, "GBP inc. VAT");
 
                 Console.WriteLine("Savings:");
-                PrintAverages(sgTotalCostGbpIncVat - aoTotalCostIncVat, totalDays, "GBP inc. VAT");
+                PrintAverages(currentSupplierTotalCostGbpIncVat - octopusAgileTotalCostIncVat, totalDays, "GBP inc. VAT");
 
-                var agilePercentage = aoTotalCostIncVat / sgTotalCostGbpIncVat * 100;
-                Console.WriteLine("Super Green 100%: 🐙🐙🐙🐙🐙🐙🐙🐙🐙🐙");
-                Console.Write($"      Agile  {agilePercentage:0}%: ");
-                for (var i = 10; i < agilePercentage; i += 10)
+                var ocotopusAgilePercentage = octopusAgileTotalCostIncVat / currentSupplierTotalCostGbpIncVat * 100;
+                Console.WriteLine("Current Supplier 100%: 🐙🐙🐙🐙🐙🐙🐙🐙🐙🐙");
+                Console.Write($"      Agile  {ocotopusAgilePercentage:0}%: ");
+                for (var i = 10; i < ocotopusAgilePercentage; i += 10)
                 {
                     Console.Write("🐙");
                 }
